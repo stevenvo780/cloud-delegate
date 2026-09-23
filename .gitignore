@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.env.*
+auth.json
+*.token
+settings.local.json
+.codex/
+.gemini/
+.claude/
+*.pem
+*.key
