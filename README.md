@@ -33,4 +33,4 @@ Las respuestas de las herramientas no enumeran rutas locales de autenticación n
 
 ## Alcance de esta extracción
 
-Esta versión pública incluye solo el servidor reutilizable y sus pruebas. No incorpora configuración de flota, instaladores de hosts, datos de cuentas ni el historial del repositorio operativo privado. El código se ofrece para revisión; todavía no se ha elegido una licencia de reutilización.
+Esta versión pública incluye solo el servidor reutilizable y sus pruebas. No incorpora configuración de flota, instaladores de hosts, datos de cuentas ni el historial del repositorio operativo privado. El código se distribuye bajo la licencia MIT; consulta `LICENSE`.
