@@ -6,6 +6,7 @@ Correr:  python3 mcp/test_cloud_mcp.py -v
 import importlib.util
 import json
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -403,36 +404,167 @@ class RoutingTests(unittest.TestCase):
 
 
 class RunProcessTests(unittest.TestCase):
-    def test_timeout_terminates_process_tree_without_pipe_hang(self):
-        with tempfile.NamedTemporaryFile(delete=False) as pid_file:
-            pid_path = pid_file.name
-        script = textwrap.dedent("""
-            import os, sys, time
-            pid_path = sys.argv[1]
+    @unittest.skipUnless(hasattr(os, "fork") and Path("/proc/self/stat").exists(),
+                         "requires POSIX process groups and Linux process state")
+    def _assert_resistant_tree_timeout(self, parent_resists, child_resists=True):
+        # The watchdog runs outside _run_process, so a pipe hang fails instead of
+        # hanging the test runner. Only the synthetic CLI's own group is cleaned up.
+        cli = textwrap.dedent("""
+            import json, os, signal, sys
+            from pathlib import Path
+            pid_path, exit_path, mode = sys.argv[1:]
+            def record_pids(pids):
+                temporary = Path(pid_path + ".tmp")
+                temporary.write_text(json.dumps(pids))
+                temporary.replace(pid_path)
+            record_pids([os.getpid()])
+            def terminate(signum, frame):
+                Path(exit_path).write_text("parent exited on TERM")
+                os._exit(0)
+            signal.signal(signal.SIGTERM, signal.SIG_IGN if mode == "resist" else terminate)
+            read_fd, write_fd = os.pipe()
             child = os.fork()
             if child == 0:
-                with open(pid_path, "w") as handle:
-                    handle.write(str(os.getpid()))
-                time.sleep(30)
+                os.close(read_fd)
+                signal.signal(signal.SIGTERM, signal.SIG_IGN if mode != "normal" else signal.SIG_DFL)
+                print("child stdout", flush=True)
+                print("child stderr", file=sys.stderr, flush=True)
+                os.write(write_fd, b"ready")
+                os.close(write_fd)
             else:
-                time.sleep(30)
+                os.close(write_fd)
+                record_pids([os.getpid(), child])
+                os.read(read_fd, 5)
+                os.close(read_fd)
+                print("parent stdout", flush=True)
+                print("parent stderr", file=sys.stderr, flush=True)
+            while True:
+                signal.pause()
         """)
-        started = time.monotonic()
-        try:
-            with self.assertRaises(subprocess.TimeoutExpired):
-                cloud_mcp._run_process([sys.executable, "-c", script, pid_path], timeout=0.3)
-            self.assertLess(time.monotonic() - started, 3.0)
-            grandchild_pid = int(Path(pid_path).read_text())
-            deadline = time.monotonic() + 1.0
-            while time.monotonic() < deadline:
-                stat_path = Path(f"/proc/{grandchild_pid}/stat")
-                if not stat_path.exists() or stat_path.read_text().split()[2] == "Z":
-                    break
-                time.sleep(0.05)
+        driver = textwrap.dedent("""
+            import importlib.util, json, subprocess, sys
+            spec = importlib.util.spec_from_file_location("cloud_mcp", sys.argv[1])
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            args = json.loads(sys.argv[2])
+            try:
+                module._run_process(args, timeout=1.0)
+            except subprocess.TimeoutExpired as exc:
+                print(json.dumps({"cmd": exc.cmd, "timeout": exc.timeout,
+                                  "output": exc.output, "stderr": exc.stderr}))
             else:
-                self.fail("grandchild remained running after timeout")
-        finally:
-            Path(pid_path).unlink(missing_ok=True)
+                sys.exit("expected TimeoutExpired")
+        """)
+        def running(pid):
+            try:
+                return Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z"
+            except FileNotFoundError:
+                return False
+
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = Path(directory) / "pids.json"
+            exit_path = Path(directory) / "parent-exit"
+            args = [sys.executable, "-c", cli, str(pid_path), str(exit_path),
+                    "resist" if parent_resists else "exit" if child_resists else "normal"]
+            worker = None
+            pids = []
+            watchdog_expired = False
+            # A separate synthetic process must survive cleanup of the CLI group.
+            sentinel = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                        start_new_session=True, stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                worker = subprocess.Popen([sys.executable, "-c", driver, str(MODULE_PATH), json.dumps(args)],
+                                          start_new_session=True, stdin=subprocess.DEVNULL,
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    stdout, stderr = worker.communicate(timeout=8)
+                except subprocess.TimeoutExpired:
+                    watchdog_expired = True
+                if watchdog_expired:
+                    self.assertEqual(exit_path.exists(), not parent_resists)
+                    self.fail("watchdog: _run_process did not return within 8 seconds")
+                self.assertEqual(worker.returncode, 0, stderr)
+                result = json.loads(stdout)
+                self.assertEqual(result["cmd"], args)
+                self.assertEqual(result["timeout"], 1.0)
+                for role in ("parent", "child"):
+                    self.assertIn(role + " stdout", result["output"])
+                    self.assertIn(role + " stderr", result["stderr"])
+                self.assertEqual(exit_path.exists(), not parent_resists)
+                pids = json.loads(pid_path.read_text())
+                self.assertEqual(len(pids), 2)
+                deadline = time.monotonic() + 1
+                while any(running(pid) for pid in pids) and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertFalse(any(running(pid) for pid in pids), "synthetic CLI tree still running")
+                self.assertIsNone(sentinel.poll(), "cleanup signalled an unrelated group")
+            finally:
+                try:
+                    if pid_path.exists():
+                        pids = json.loads(pid_path.read_text())
+                        try:
+                            os.killpg(pids[0], signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                finally:
+                    try:
+                        if worker is not None:
+                            if worker.poll() is None:
+                                worker.kill()
+                            worker.communicate(timeout=2)
+                    finally:
+                        sentinel.kill()
+                        sentinel.wait(timeout=2)
+                deadline = time.monotonic() + 1
+                while any(running(pid) for pid in pids) and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertFalse(any(running(pid) for pid in pids), "watchdog cleanup left live processes")
+                if watchdog_expired:
+                    print("watchdog cleanup verified: no synthetic process remains running", file=sys.stderr)
+
+    def test_timeout_when_parent_exits_but_child_ignores_term(self):
+        self._assert_resistant_tree_timeout(parent_resists=False)
+
+    def test_timeout_when_parent_and_child_ignore_term(self):
+        self._assert_resistant_tree_timeout(parent_resists=True)
+
+    def test_normal_process_preserves_input_environment_cwd_and_exit_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = [sys.executable, "-c", "import os, sys; print(sys.stdin.read()); "
+                    "print(os.environ['SYNTHETIC_VALUE']); print(os.getcwd()); "
+                    "print('diagnostic', file=sys.stderr); sys.exit(7)"]
+            result = cloud_mcp._run_process(args, timeout=5, input="payload",
+                                            env={"SYNTHETIC_VALUE": "synthetic"}, cwd=directory)
+            self.assertEqual(result.args, args)
+            self.assertEqual(result.returncode, 7)
+            self.assertEqual(result.stdout, f"payload\nsynthetic\n{directory}\n")
+            self.assertEqual(result.stderr, "diagnostic\n")
+
+    def test_timeout_closes_retained_pipes_and_preserves_latest_partial_output(self):
+        args = ["synthetic-cli", "original-argument"]
+        process = mock.Mock(pid=12345, encoding="utf-8")
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired(args, 0.5, output=b"first", stderr=b"diagnostic"),
+            subprocess.TimeoutExpired(args, 2, output=b"first second"),
+            subprocess.TimeoutExpired(args, 2, output=b"first second last\xff"),
+        ]
+        process.wait.side_effect = subprocess.TimeoutExpired(args, 2)
+        with mock.patch.object(cloud_mcp.subprocess, "Popen", return_value=process), \
+             mock.patch.object(cloud_mcp.os, "killpg", side_effect=ProcessLookupError):
+            with self.assertRaises(subprocess.TimeoutExpired) as ctx:
+                cloud_mcp._run_process(args, timeout=0.5, input="payload")
+        self.assertIs(ctx.exception.cmd, args)
+        self.assertEqual(ctx.exception.timeout, 0.5)
+        self.assertEqual(ctx.exception.output, "first second last\ufffd")
+        self.assertEqual(ctx.exception.stderr, "diagnostic")
+        for call in process.communicate.call_args_list + process.wait.call_args_list:
+            self.assertGreater(call.kwargs["timeout"], 0)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            stream.close.assert_called_once()
+
+    def test_timeout_terminates_process_tree_without_pipe_hang(self):
+        self._assert_resistant_tree_timeout(parent_resists=False, child_resists=False)
 
     def test_missing_cli_is_a_clear_error(self):
         with self.assertRaises(cloud_mcp.DelegationError) as ctx:

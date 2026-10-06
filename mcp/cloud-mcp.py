@@ -212,16 +212,39 @@ def _run_process(args, *, timeout, input=None, env=None, cwd=None):
         raise DelegationError(f"CLI no encontrado en PATH: {args[0]}")
     try:
         stdout, stderr = process.communicate(input=input, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=2)
-        except (ProcessLookupError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired as exc:
+        stdout, stderr = exc.output, exc.stderr
+        drained = False
+        # Esperar al padre no garantiza EOF: un descendiente puede retener los
+        # pipes. Señalizar siempre el grupo propio y acotar ambos drenajes.
+        for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                os.killpg(process.pid, sig)
             except ProcessLookupError:
                 pass
-        stdout, stderr = process.communicate()
+            try:
+                stdout, stderr = process.communicate(timeout=2)
+                drained = True
+            except subprocess.TimeoutExpired as partial:
+                if partial.output is not None:
+                    stdout = partial.output
+                if partial.stderr is not None:
+                    stderr = partial.stderr
+                drained = False
+        if not drained:
+            # Un pipe retenido fuera del grupo no debe bloquear el servidor.
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        # TimeoutExpired puede contener bytes incluso con text=True.
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(process.encoding or "utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(process.encoding or "utf-8", errors="replace")
         raise subprocess.TimeoutExpired(args, timeout, output=stdout, stderr=stderr)
     return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
 
